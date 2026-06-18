@@ -1,61 +1,139 @@
 package pinch
 
 import (
-	. "github.com/smartystreets/goconvey/convey"
-
+	"archive/zip"
+	"bytes"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"slices"
 	"testing"
+	"time"
 )
 
-func TestPinch(t *testing.T) {
-	url := "http://peterhellberg.github.io/pinch/test.zip"
-	file := "data.json"
+// zipFiles is the fixture content, in the order it is written to the archive.
+var zipFiles = []struct {
+	name string
+	data []byte
+}{
+	{"data.json", []byte(`{"gem":"pinch","authors":["Peter Hellberg","Edward Patel"]}`)},
+	{"images/note.txt", []byte("a pine cone")},
+}
 
-	exampleData := []byte(
-		"{\"gem\":\"pinch\",\"authors\":[\"Peter Hellberg\",\"Edward Patel\"]," +
-			"\"github_url\":\"https://github.com/peterhellberg/pinch\"}\n")
+// newZipServer builds an in-memory ZIP archive from zipFiles and serves it at
+// /test.zip with full Range support via http.ServeContent.
+func newZipServer(t *testing.T) string {
+	t.Helper()
 
-	exampleEntries := map[string]ZipEntry{
-		"data.json": ZipEntry{
-			"data.json", 97, 114, 8, 24, 0},
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, f := range zipFiles {
+		w, err := zw.Create(f.name)
+		if err != nil {
+			t.Fatalf("zip.Create(%q): %v", f.name, err)
+		}
+		if _, err := w.Write(f.data); err != nil {
+			t.Fatalf("write %q: %v", f.name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zip.Close: %v", err)
+	}
+	content := buf.Bytes()
 
-		"images/pine_cone.jpg": ZipEntry{
-			"images/pine_cone.jpg", 2516037, 2518084, 8, 24, 229},
+	mux := http.NewServeMux()
+	mux.HandleFunc("/test.zip", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "test.zip", time.Time{}, bytes.NewReader(content))
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	return srv.URL
+}
+
+func TestGet(t *testing.T) {
+	url := newZipServer(t) + "/test.zip"
+
+	for _, f := range zipFiles {
+		got, err := Get(t.Context(), url, f.name)
+		if err != nil {
+			t.Fatalf("Get(%q): %v", f.name, err)
+		}
+		if !bytes.Equal(got, f.data) {
+			t.Errorf("Get(%q) = %q, want %q", f.name, got, f.data)
+		}
+	}
+}
+
+func TestGetMissingFile(t *testing.T) {
+	url := newZipServer(t) + "/test.zip"
+
+	_, err := Get(t.Context(), url, "missing.json")
+	if !errors.Is(err, ErrFileNotFound) {
+		t.Fatalf("Get missing file: got %v, want ErrFileNotFound", err)
+	}
+}
+
+func TestGetMissingArchive(t *testing.T) {
+	url := newZipServer(t) + "/missing.zip"
+
+	_, err := Get(t.Context(), url, "data.json")
+
+	var se *StatusError
+	if !errors.As(err, &se) {
+		t.Fatalf("Get missing archive: got %v, want *StatusError", err)
+	}
+	if se.StatusCode != http.StatusNotFound {
+		t.Errorf("StatusCode = %d, want %d", se.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestWithClient(t *testing.T) {
+	url := newZipServer(t) + "/test.zip"
+
+	rt := &countingTransport{base: http.DefaultTransport}
+	client := &http.Client{Transport: rt}
+
+	if _, err := Get(t.Context(), url, "data.json", WithClient(client)); err != nil {
+		t.Fatalf("Get with custom client: %v", err)
+	}
+	if rt.calls == 0 {
+		t.Error("custom client was not used")
 	}
 
-	Convey("Get", t, func() {
-		Convey("known file from example ZIP archive", func() {
-			data, _ := Get(url, file)
+	// A nil client must be ignored, leaving the default in place.
+	if _, err := Get(t.Context(), url, "data.json", WithClient(nil)); err != nil {
+		t.Fatalf("Get with nil client: %v", err)
+	}
+}
 
-			So(data, ShouldResemble, exampleData)
-		})
+type countingTransport struct {
+	base  http.RoundTripper
+	calls int
+}
 
-		Convey("missing file from example ZIP archive", func() {
-			_, err := Get(url, "missing.zip")
+func (t *countingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	t.calls++
+	return t.base.RoundTrip(r)
+}
 
-			So(err, ShouldResemble, errors.New("file not found in archive"))
-		})
+func TestList(t *testing.T) {
+	url := newZipServer(t) + "/test.zip"
 
-		Convey("missing ZIP archive", func() {
-			_, err := Get("http://example.com/missing.zip", file)
+	got, err := List(t.Context(), url)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
 
-			So(err, ShouldResemble, errors.New("404 Not Found"))
-		})
-	})
+	want := make([]string, len(zipFiles))
+	for i, f := range zipFiles {
+		want[i] = f.name
+	}
+	slices.Sort(got)
+	slices.Sort(want)
 
-	Convey("GetZipFile", t, func() {
-		Convey("file from URL and ZipEntry", func() {
-			data, _ := GetZipFile(url, exampleEntries["data.json"])
-
-			So(data, ShouldResemble, exampleData)
-		})
-	})
-
-	Convey("GetZipDirectory", t, func() {
-		Convey("example ZIP file", func() {
-			entries, _ := GetZipDirectory(url)
-
-			So(entries, ShouldResemble, exampleEntries)
-		})
-	})
+	if !slices.Equal(got, want) {
+		t.Errorf("List = %v, want %v", got, want)
+	}
 }
