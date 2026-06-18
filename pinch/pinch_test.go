@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -132,6 +134,123 @@ type countingTransport struct {
 func (t *countingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	t.calls++
 	return t.base.RoundTrip(r)
+}
+
+// rangeTrackingServer serves content and records the union of byte offsets it
+// actually transmits, so a test can prove only part of the archive was read.
+type rangeTrackingServer struct {
+	content []byte
+	served  []bool // served[i] == true once byte i has been sent to a client
+	bytes   int64  // total distinct bytes transmitted across all responses
+}
+
+func (s *rangeTrackingServer) handler(w http.ResponseWriter, r *http.Request) {
+	// http.ServeContent parses the Range header for us; re-parse it here to
+	// mark which offsets get sent.
+	if spec, ok := strings.CutPrefix(r.Header.Get("Range"), "bytes="); ok {
+		if lo, hi, ok := strings.Cut(spec, "-"); ok {
+			start, err1 := strconv.ParseInt(lo, 10, 64)
+			end, err2 := strconv.ParseInt(hi, 10, 64)
+			if err1 == nil && err2 == nil {
+				if end >= int64(len(s.content)) {
+					end = int64(len(s.content)) - 1
+				}
+				for i := start; i <= end && i >= 0 && i < int64(len(s.content)); i++ {
+					if !s.served[i] {
+						s.served[i] = true
+						s.bytes++
+					}
+				}
+			}
+		}
+	}
+	http.ServeContent(w, r, "test.zip", time.Time{}, bytes.NewReader(s.content))
+}
+
+// TestOnlyPartialDownload is a regression guard against accidentally fetching
+// the whole archive: it builds an archive with a large stored file and a small
+// file, fetches only the small file, and asserts the large file's body is never
+// transmitted. The lone exception is archive/zip's end-of-central-directory
+// scan, which reads the last 1 KiB of the file to find the EOCD signature and
+// so unavoidably laps over the tail of the preceding file's body.
+func TestOnlyPartialDownload(t *testing.T) {
+	// A 1 MiB blob, stored (not deflated) so its bytes appear verbatim in the
+	// archive as a large, contiguous, identifiable region.
+	big := make([]byte, 1<<20)
+	for i := range big {
+		big[i] = byte(i * 31)
+	}
+	small := []byte("the one true pine cone")
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+
+	bw, err := zw.CreateHeader(&zip.FileHeader{Name: "big.bin", Method: zip.Store})
+	if err != nil {
+		t.Fatalf("CreateHeader big.bin: %v", err)
+	}
+	if _, err := bw.Write(big); err != nil {
+		t.Fatalf("write big.bin: %v", err)
+	}
+
+	sw, err := zw.Create("small.txt")
+	if err != nil {
+		t.Fatalf("Create small.txt: %v", err)
+	}
+	if _, err := sw.Write(small); err != nil {
+		t.Fatalf("write small.txt: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zip.Close: %v", err)
+	}
+
+	content := buf.Bytes()
+	bigOffset := bytes.Index(content, big) // start of the stored big.bin body
+	if bigOffset < 0 {
+		t.Fatal("could not locate big.bin body in archive")
+	}
+
+	srv := &rangeTrackingServer{content: content, served: make([]bool, len(content))}
+	ts := httptest.NewServer(http.HandlerFunc(srv.handler))
+	t.Cleanup(ts.Close)
+
+	got, err := Get(t.Context(), ts.URL+"/test.zip", "small.txt")
+	if err != nil {
+		t.Fatalf("Get(small.txt): %v", err)
+	}
+	if !bytes.Equal(got, small) {
+		t.Fatalf("Get(small.txt) = %q, want %q", got, small)
+	}
+
+	// The body of big.bin BEFORE the trailing EOCD scan window must never be
+	// transmitted: that would mean we downloaded the file we never asked for.
+	const eocdScanWindow = 1024
+	scanFloor := int64(len(content)) - eocdScanWindow
+
+	bodyServed, firstServed := 0, int64(-1)
+	for i := int64(bigOffset); i < int64(bigOffset)+int64(len(big)); i++ {
+		if srv.served[i] {
+			bodyServed++
+			if firstServed < 0 {
+				firstServed = i
+			}
+		}
+	}
+	if firstServed >= 0 && firstServed < scanFloor {
+		t.Errorf("big.bin body fetched at offset %d, before the EOCD scan floor %d",
+			firstServed, scanFloor)
+	}
+
+	t.Logf("archive size:        %d bytes", len(content))
+	t.Logf("total transmitted:   %d bytes (%.3f%%)", srv.bytes, 100*float64(srv.bytes)/float64(len(content)))
+	t.Logf("big.bin body served: %d of %d bytes, within the trailing %d-byte EOCD scan window",
+		bodyServed, len(big), eocdScanWindow)
+
+	// The whole point: far less than the big payload crosses the wire.
+	if srv.bytes >= int64(len(big)) {
+		t.Errorf("transmitted %d bytes, expected far less than the %d-byte payload",
+			srv.bytes, len(big))
+	}
 }
 
 func TestList(t *testing.T) {
