@@ -175,11 +175,9 @@ func remoteSize(ctx context.Context, client *http.Client, url string) (int64, er
 		}
 		return 0, errors.New("could not parse Content-Range header")
 	case http.StatusOK:
-		// Server ignored the Range header and sent the whole body.
-		if resp.ContentLength < 0 {
-			return 0, errors.New("server does not report a content length")
-		}
-		return resp.ContentLength, nil
+		// Server ignored the Range header and sent the whole body, so it
+		// cannot serve the partial reads the rest of the package relies on.
+		return 0, errors.New("server does not support range requests")
 	default:
 		return 0, &StatusError{StatusCode: resp.StatusCode, Status: resp.Status}
 	}

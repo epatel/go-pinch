@@ -89,6 +89,22 @@ func TestGetMissingArchive(t *testing.T) {
 	}
 }
 
+func TestNoRangeSupport(t *testing.T) {
+	// A server that ignores the Range header and always replies 200 OK.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("not a zip"))
+	}))
+	t.Cleanup(srv.Close)
+
+	_, err := Open(t.Context(), srv.URL)
+	if err == nil {
+		t.Fatal("Open succeeded, want range-support error")
+	}
+	if got, want := err.Error(), "server does not support range requests"; got != want {
+		t.Errorf("error = %q, want %q", got, want)
+	}
+}
+
 func TestWithClient(t *testing.T) {
 	url := newZipServer(t) + "/test.zip"
 
