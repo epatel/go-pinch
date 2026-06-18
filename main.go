@@ -70,12 +70,12 @@ func run(ctx context.Context, out io.Writer, rawURL, name string) error {
 
 func parseArgs(args []string) (rawURL, name string, err error) {
 	if len(args) < 2 || len(args) > 3 {
-		return "", "", errors.New("Usage: go-pinch <url> [file]")
+		return "", "", errors.New("usage: go-pinch <url> [file]")
 	}
 
 	u, err := url.ParseRequestURI(args[1])
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-		return "", "", errors.New("Invalid URL (must be http or https)")
+		return "", "", errors.New("invalid URL (must be http or https)")
 	}
 
 	if len(args) == 3 {
