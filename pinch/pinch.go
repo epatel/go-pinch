@@ -140,7 +140,7 @@ func (r *readerAt) ReadAt(p []byte, off int64) (int, error) {
 	}
 
 	n, err := io.ReadFull(resp.Body, p)
-	if err == io.ErrUnexpectedEOF {
+	if errors.Is(err, io.ErrUnexpectedEOF) {
 		// A short final read means we asked past the end of the archive.
 		err = io.EOF
 	}
