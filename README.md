@@ -1,5 +1,6 @@
 # Go Pinch
 
+[![Test](https://github.com/peterhellberg/go-pinch/actions/workflows/test.yml/badge.svg)](https://github.com/peterhellberg/go-pinch/actions/workflows/test.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/peterhellberg/go-pinch/pinch.svg)](https://pkg.go.dev/github.com/peterhellberg/go-pinch/pinch)
 [![License MIT](https://img.shields.io/badge/license-MIT-lightgrey.svg?style=flat)](https://github.com/peterhellberg/go-pinch#license-mit)
 
