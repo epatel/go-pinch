@@ -1,34 +1,32 @@
 /*
+Retrieve a file from inside a zip archive, over the network!
 
-Retrieve a file from inside a zip file, over the network!
-
-Pinch makes it possible to download a specific file from within
-a ZIP file over HTTP/1.1, using nothing but the Go Standard Library.
-
-(http://golang.org/pkg/net/http/ and http://golang.org/pkg/compress/flate/)
+Pinch downloads a specific file from within a ZIP archive over HTTP,
+using nothing but the Go standard library.
 
 Earlier versions were written in Objective-C and Ruby.
 
-Installation
+# Installation
 
-Just go get it:
+	go install github.com/peterhellberg/go-pinch@latest
 
-		go get -u github.com/peterhellberg/go-pinch
+# Usage
 
-Usage
+List the files in a remote archive by passing only a URL:
 
-You get a list of files if you only pass a URL:
+	go-pinch https://example.com/path/to.zip
 
-		go-pinch http://example/path/to.zip
+Pinch one of the files out of the archive:
 
-In order to pinch one of the files in the ZIP:
-
-		go-pinch http://example/path/to.zip file.json > file.json
-
+	go-pinch https://example.com/path/to.zip file.json > file.json
 */
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net/url"
 	"os"
@@ -37,59 +35,52 @@ import (
 )
 
 func main() {
-	url, fn := getArgs(os.Args)
+	log.SetFlags(0)
 
-	if len(fn) > 0 {
-		writeFileToStdout(url, fn)
-	} else {
-		listFilesToStdout(url)
-	}
-}
-
-func getArgs(args []string) (string, string) {
-	// Make sure that we got two or three command line arguments
-	if len(args) < 2 || len(args) > 3 {
-		fatal("Usage: go-pinch <url> [file]")
-	}
-
-	// Parse the URI parameter
-	_, err := url.ParseRequestURI(args[1])
-
-	if err != nil || args[1][0:4] != "http" {
-		fatal("Invalid URL")
-	}
-
-	if len(args) == 2 {
-		return args[1], ""
-	}
-
-	return args[1], args[2]
-}
-
-func writeFileToStdout(url, fn string) {
-	file, err := pinch.Get(url, fn)
-
-	handleError(err)
-
-	os.Stdout.Write(file)
-}
-
-func listFilesToStdout(url string) {
-	entries, err := pinch.GetZipDirectory(url)
-
-	handleError(err)
-
-	for _, entry := range entries {
-		os.Stdout.Write([]byte(entry.Filename + "\n"))
-	}
-}
-
-func fatal(v ...interface{}) {
-	log.Fatalln(v...)
-}
-
-func handleError(err error) {
+	rawURL, name, err := parseArgs(os.Args)
 	if err != nil {
-		fatal(err)
+		log.Fatal(err)
 	}
+
+	if err := run(context.Background(), os.Stdout, rawURL, name); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run(ctx context.Context, out io.Writer, rawURL, name string) error {
+	if name != "" {
+		data, err := pinch.Get(ctx, rawURL, name)
+		if err != nil {
+			return err
+		}
+		_, err = out.Write(data)
+		return err
+	}
+
+	names, err := pinch.List(ctx, rawURL)
+	if err != nil {
+		return err
+	}
+	for _, n := range names {
+		fmt.Fprintln(out, n)
+	}
+
+	return nil
+}
+
+func parseArgs(args []string) (rawURL, name string, err error) {
+	if len(args) < 2 || len(args) > 3 {
+		return "", "", errors.New("usage: go-pinch <url> [file]")
+	}
+
+	u, err := url.ParseRequestURI(args[1])
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", "", errors.New("invalid URL (must be http or https)")
+	}
+
+	if len(args) == 3 {
+		return args[1], args[2], nil
+	}
+
+	return args[1], "", nil
 }
