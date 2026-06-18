@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -44,22 +43,24 @@ func TestRun(t *testing.T) {
 	url := newZipServer(t) + "/test.zip"
 
 	t.Run("list", func(t *testing.T) {
-		out := captureStdout(t, func(f *os.File) error {
-			return run(t.Context(), f, url, "")
-		})
+		var out bytes.Buffer
+		if err := run(t.Context(), &out, url, ""); err != nil {
+			t.Fatalf("run: %v", err)
+		}
 		for _, want := range []string{"data.json", "images/note.txt"} {
-			if !strings.Contains(out, want) {
-				t.Errorf("list output %q does not contain %q", out, want)
+			if !strings.Contains(out.String(), want) {
+				t.Errorf("list output %q does not contain %q", out.String(), want)
 			}
 		}
 	})
 
 	t.Run("get", func(t *testing.T) {
-		out := captureStdout(t, func(f *os.File) error {
-			return run(t.Context(), f, url, "data.json")
-		})
-		if !strings.Contains(out, `"gem":"pinch"`) {
-			t.Errorf("get output = %q", out)
+		var out bytes.Buffer
+		if err := run(t.Context(), &out, url, "data.json"); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		if !strings.Contains(out.String(), `"gem":"pinch"`) {
+			t.Errorf("get output = %q", out.String())
 		}
 	})
 }
@@ -99,26 +100,4 @@ func newZipServer(t *testing.T) string {
 	t.Cleanup(srv.Close)
 
 	return srv.URL
-}
-
-// captureStdout runs fn with a temp file and returns what it wrote.
-func captureStdout(t *testing.T, fn func(*os.File) error) string {
-	t.Helper()
-
-	f, err := os.CreateTemp(t.TempDir(), "out")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-
-	if err := fn(f); err != nil {
-		t.Fatalf("run: %v", err)
-	}
-
-	data, err := os.ReadFile(f.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return string(data)
 }
