@@ -1,176 +1,184 @@
-// Copyright (c) 2013-2014 Peter Hellberg, Edward Patel.
-// Licensed under the MIT License found in the LICENSE file.
-
+// Package pinch retrieves individual files from inside a remote ZIP archive
+// over HTTP, without downloading the whole archive.
+//
+// It works by serving an [io.ReaderAt] backed by HTTP Range requests to
+// [archive/zip], so only the bytes that archive/zip actually reads — the end
+// record, the central directory, and the requested file — are fetched.
 package pinch
 
 import (
-	"bytes"
-	"compress/flate"
+	"archive/zip"
+	"context"
 	"errors"
 	"fmt"
-	"unsafe"
+	"io"
+	"io/fs"
+	"net/http"
+	"strconv"
+	"strings"
 )
 
-// Get a file from URL and filename (string)
-func Get(url, fn string) ([]byte, error) {
-	entries, err := GetZipDirectory(url)
+// ErrFileNotFound is returned by [Get] when the named file is not present in
+// the archive.
+var ErrFileNotFound = errors.New("file not found in archive")
 
-	if err != nil {
-		return nil, err
-	}
-
-	entry := entries[fn]
-
-	if len(entry.Filename) > 0 {
-		file, err := GetZipFile(url, entry)
-
-		if err != nil {
-			return nil, err
-		}
-
-		return file, nil
-	}
-
-	return nil, errors.New("file not found")
+// StatusError is returned when the server responds with an unexpected HTTP
+// status, such as 404 for a missing archive.
+type StatusError struct {
+	StatusCode int
+	Status     string
 }
 
-// GetZipFile Get a file from URL and ZipEntry
-func GetZipFile(url string, entry ZipEntry) ([]byte, error) {
-	entry.echo()
+func (e *StatusError) Error() string { return e.Status }
 
-	fnSize := uint32(len(entry.Filename))
-	offset := int64(entry.RelativeOffsetOfLocalFileHeader)
-	length := int64(30+fnSize+uint32(entry.ExtraFieldLength)+entry.CompressedSize) + 16
+// An Option configures optional behaviour for [Open], [Get] and [List].
+type Option func(*config)
 
-	echo("\nGet file data:")
-	body, err := fetchPartialData(url, offset, offset+length)
-
-	if err != nil {
-		return nil, err
-	}
-
-	var file *ZipFileHeader
-	file = (*ZipFileHeader)(unsafe.Pointer(&body[0]))
-
-	if file.LocalFileHeaderSignature == 0x04034b50 {
-		startOffset := file.StartOffset()
-
-		if file.CompressionMethod == 8 {
-			data := body[startOffset : startOffset+file.CompressedSize()]
-
-			zipreader := flate.NewReader(bytes.NewReader(data))
-
-			buf := new(bytes.Buffer)
-			buf.ReadFrom(zipreader)
-
-			b := buf.Bytes()
-			zipreader.Close()
-
-			return b, nil
-		} else if file.CompressionMethod == 0 {
-			return body[startOffset : startOffset+file.OriginalSize()], nil
-		}
-
-		err = errors.New("unimplemented compression method")
-	} else {
-		err = errors.New("corrupt file (signature error)")
-	}
-
-	return nil, err
+type config struct {
+	client *http.Client
 }
 
-// GetZipDirectory Get the directory for a remote (url) zip archive
-func GetZipDirectory(url string) (map[string]ZipEntry, error) {
-	var of int64
-	cl, err := getContentLength(url)
-
-	if err != nil {
-		return nil, err
+func newConfig(opts []Option) config {
+	cfg := config{client: http.DefaultClient}
+	for _, opt := range opts {
+		opt(&cfg)
 	}
+	return cfg
+}
 
-	if cl >= 4096 {
-		of = cl - 4096
-	}
-
-	echo("\nGet 4k from EOF and look for the End Record:")
-	body, err := fetchPartialData(url, of, cl)
-
-	if err != nil {
-		return nil, err
-	}
-
-	entries := make(map[string]ZipEntry)
-
-	var dir *ZipDirRecord
-	var rec *ZipEndRecord
-
-	// Find the End Record
-	endOffset := bytes.Index(body, []byte{0x50, 0x4b, 0x05, 0x06})
-
-	if endOffset >= 0 {
-		buf := body[endOffset : endOffset+int(unsafe.Sizeof(ZipEndRecord{}))]
-
-		rec = (*ZipEndRecord)(unsafe.Pointer(&buf[0]))
-
-		rec.echo()
-
-		echo("Get the Central Directory Record:")
-		body, err := fetchPartialData(url, rec.StartOffset(), rec.EndOffset())
-
-		if err != nil {
-			return nil, err
+// WithClient sets the [http.Client] used to fetch archive data. A nil client
+// is ignored, leaving the default in place. Request cancellation is driven by
+// the context passed to [Open], [Get] and [List], so a client timeout is
+// usually unnecessary.
+func WithClient(c *http.Client) Option {
+	return func(cfg *config) {
+		if c != nil {
+			cfg.client = c
 		}
+	}
+}
 
-		var l = int32(rec.SizeOfCentralDirectory)
-		var i int32
+// Open returns a [zip.Reader] for the ZIP archive at url. The reader fetches
+// archive data lazily through HTTP Range requests; the returned reader is only
+// valid while ctx is not cancelled.
+func Open(ctx context.Context, url string, opts ...Option) (*zip.Reader, error) {
+	cfg := newConfig(opts)
 
-		// Read the entries
-		for l > 46 {
-			buf = body[i : i+int32(unsafe.Sizeof(ZipDirRecord{}))]
+	size, err := remoteSize(ctx, cfg.client, url)
+	if err != nil {
+		return nil, err
+	}
 
-			dir = (*ZipDirRecord)(unsafe.Pointer(&buf[0]))
+	return zip.NewReader(&readerAt{ctx: ctx, client: cfg.client, url: url}, size)
+}
 
-			if dir.CentralDirectoryFileHeaderSignature == 0x02014b50 {
-				var entry ZipEntry
+// Get retrieves the contents of the named file from the ZIP archive at url. It
+// returns [ErrFileNotFound] if the archive does not contain name.
+func Get(ctx context.Context, url, name string, opts ...Option) ([]byte, error) {
+	zr, err := Open(ctx, url, opts...)
+	if err != nil {
+		return nil, err
+	}
 
-				// Only collect files (skipping directories)
-				if (dir.ExternalFileAttributesH & 0x4000) != 0x4000 {
-					fn := string(body[i+46 : i+46+int32(dir.FileNameLength)])
+	f, err := zr.Open(name)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, ErrFileNotFound
+		}
+		return nil, err
+	}
+	defer f.Close()
 
-					populateEntry(&entry, dir, fn)
+	return io.ReadAll(f)
+}
 
-					entries[fn] = entry
-				}
+// List returns the names of the files (excluding directories) in the ZIP
+// archive at url.
+func List(ctx context.Context, url string, opts ...Option) ([]string, error) {
+	zr, err := Open(ctx, url, opts...)
+	if err != nil {
+		return nil, err
+	}
 
-				l = l - dir.CombinedLength()
-				i = i + dir.CombinedLength()
-			} else {
-				err = errors.New("corrupt directory (signature error)")
-				break
+	names := make([]string, 0, len(zr.File))
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		names = append(names, f.Name)
+	}
+
+	return names, nil
+}
+
+// readerAt implements [io.ReaderAt] by issuing an HTTP Range request per read.
+type readerAt struct {
+	ctx    context.Context
+	client *http.Client
+	url    string
+}
+
+func (r *readerAt) ReadAt(p []byte, off int64) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	req, err := http.NewRequestWithContext(r.ctx, http.MethodGet, r.url, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, off+int64(len(p))-1))
+
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusPartialContent {
+		return 0, &StatusError{StatusCode: resp.StatusCode, Status: resp.Status}
+	}
+
+	n, err := io.ReadFull(resp.Body, p)
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		// A short final read means we asked past the end of the archive.
+		err = io.EOF
+	}
+
+	return n, err
+}
+
+// remoteSize determines the total size of the resource at url, preferring the
+// total reported in a Content-Range header from a tiny Range request.
+func remoteSize(ctx context.Context, client *http.Client, url string) (int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Range", "bytes=0-0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		// Content-Range: bytes 0-0/12345
+		cr := resp.Header.Get("Content-Range")
+		if i := strings.LastIndex(cr, "/"); i >= 0 {
+			if size, err := strconv.ParseInt(cr[i+1:], 10, 64); err == nil {
+				return size, nil
 			}
 		}
-
-		dir.echo()
-	}
-
-	return entries, err
-}
-
-func populateEntry(entry *ZipEntry, dir *ZipDirRecord, fn string) *ZipEntry {
-	entry.Filename = fn
-	entry.CompressedSize = dir.CompressedSize
-	entry.UncompressedSize = dir.UncompressedSize
-	entry.CompressionMethod = dir.CompressionMethod
-	entry.ExtraFieldLength = dir.ExtraFieldLength
-	entry.RelativeOffsetOfLocalFileHeader = dir.RelativeOffset()
-
-	return entry
-}
-
-func echo(v ...interface{}) {
-	if false {
-		fmt.Print("\033[1;30m")
-		fmt.Println(v...)
-		fmt.Print("\033[0m")
+		return 0, errors.New("could not parse Content-Range header")
+	case http.StatusOK:
+		// Server ignored the Range header and sent the whole body, so it
+		// cannot serve the partial reads the rest of the package relies on.
+		return 0, errors.New("server does not support range requests")
+	default:
+		return 0, &StatusError{StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 }
