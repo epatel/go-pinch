@@ -73,8 +73,7 @@ func parseArgs(args []string) (rawURL, name string, err error) {
 		return "", "", errors.New("usage: go-pinch <url> [file]")
 	}
 
-	u, err := url.ParseRequestURI(args[1])
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+	if !isHTTPURL(args[1]) {
 		return "", "", errors.New("invalid URL (must be http or https)")
 	}
 
@@ -83,4 +82,13 @@ func parseArgs(args []string) (rawURL, name string, err error) {
 	}
 
 	return args[1], "", nil
+}
+
+// isHTTPURL reports whether raw is an absolute http or https URL.
+func isHTTPURL(raw string) bool {
+	u, err := url.ParseRequestURI(raw)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "http" || u.Scheme == "https"
 }
