@@ -3,11 +3,10 @@ package main
 import (
 	"archive/zip"
 	"bytes"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
+
+	"github.com/peterhellberg/go-pinch/internal/ziptest"
 )
 
 func TestParseArgs(t *testing.T) {
@@ -69,35 +68,8 @@ func TestRun(t *testing.T) {
 // support.
 func newZipServer(t *testing.T) string {
 	t.Helper()
-
-	files := []struct{ name, data string }{
-		{"data.json", `{"gem":"pinch","authors":["Peter Hellberg"]}`},
-		{"images/note.txt", "a pine cone"},
-	}
-
-	var buf bytes.Buffer
-	zw := zip.NewWriter(&buf)
-	for _, f := range files {
-		w, err := zw.Create(f.name)
-		if err != nil {
-			t.Fatalf("zip.Create(%q): %v", f.name, err)
-		}
-		if _, err := w.Write([]byte(f.data)); err != nil {
-			t.Fatalf("write %q: %v", f.name, err)
-		}
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatalf("zip.Close: %v", err)
-	}
-	content := buf.Bytes()
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/test.zip", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeContent(w, r, "test.zip", time.Time{}, bytes.NewReader(content))
-	})
-
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-
-	return srv.URL
+	return ziptest.NewServer(t,
+		ziptest.File{Name: "data.json", Data: []byte(`{"gem":"pinch","authors":["Peter Hellberg"]}`), Method: zip.Deflate},
+		ziptest.File{Name: "images/note.txt", Data: []byte("a pine cone"), Method: zip.Deflate},
+	)
 }

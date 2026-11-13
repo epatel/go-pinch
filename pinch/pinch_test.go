@@ -10,60 +10,32 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
+
+	"github.com/peterhellberg/go-pinch/internal/ziptest"
 )
 
 // zipFiles is the fixture content, in the order it is written to the archive.
-var zipFiles = []struct {
-	name string
-	data []byte
-}{
-	{"data.json", []byte(`{"gem":"pinch","authors":["Peter Hellberg","Edward Patel"]}`)},
-	{"images/note.txt", []byte("a pine cone")},
+var zipFiles = []ziptest.File{
+	{Name: "data.json", Data: []byte(`{"gem":"pinch","authors":["Peter Hellberg","Edward Patel"]}`), Method: zip.Deflate},
+	{Name: "images/note.txt", Data: []byte("a pine cone"), Method: zip.Deflate},
 }
 
-// newZipServer builds an in-memory ZIP archive from zipFiles and serves it at
-// /test.zip with full Range support via http.ServeContent.
+// newZipServer serves zipFiles at /test.zip with full Range support.
 func newZipServer(t *testing.T) string {
 	t.Helper()
-
-	var buf bytes.Buffer
-	zw := zip.NewWriter(&buf)
-	for _, f := range zipFiles {
-		w, err := zw.Create(f.name)
-		if err != nil {
-			t.Fatalf("zip.Create(%q): %v", f.name, err)
-		}
-		if _, err := w.Write(f.data); err != nil {
-			t.Fatalf("write %q: %v", f.name, err)
-		}
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatalf("zip.Close: %v", err)
-	}
-	content := buf.Bytes()
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/test.zip", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeContent(w, r, "test.zip", time.Time{}, bytes.NewReader(content))
-	})
-
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-
-	return srv.URL
+	return ziptest.NewServer(t, zipFiles...)
 }
 
 func TestGet(t *testing.T) {
 	url := newZipServer(t) + "/test.zip"
 
 	for _, f := range zipFiles {
-		got, err := Get(t.Context(), url, f.name)
+		got, err := Get(t.Context(), url, f.Name)
 		if err != nil {
-			t.Fatalf("Get(%q): %v", f.name, err)
+			t.Fatalf("Get(%q): %v", f.Name, err)
 		}
-		if !bytes.Equal(got, f.data) {
-			t.Errorf("Get(%q) = %q, want %q", f.name, got, f.data)
+		if !bytes.Equal(got, f.Data) {
+			t.Errorf("Get(%q) = %q, want %q", f.Name, got, f.Data)
 		}
 	}
 }
@@ -147,24 +119,66 @@ type rangeTrackingServer struct {
 func (s *rangeTrackingServer) handler(w http.ResponseWriter, r *http.Request) {
 	// http.ServeContent parses the Range header for us; re-parse it here to
 	// mark which offsets get sent.
-	if spec, ok := strings.CutPrefix(r.Header.Get("Range"), "bytes="); ok {
-		if lo, hi, ok := strings.Cut(spec, "-"); ok {
-			start, err1 := strconv.ParseInt(lo, 10, 64)
-			end, err2 := strconv.ParseInt(hi, 10, 64)
-			if err1 == nil && err2 == nil {
-				if end >= int64(len(s.content)) {
-					end = int64(len(s.content)) - 1
-				}
-				for i := start; i <= end && i >= 0 && i < int64(len(s.content)); i++ {
-					if !s.served[i] {
-						s.served[i] = true
-						s.bytes++
-					}
-				}
-			}
+	if start, end, ok := parseRange(r.Header.Get("Range"), int64(len(s.content))); ok {
+		s.mark(start, end)
+	}
+	ziptest.ServeContent(w, r, s.content)
+}
+
+// parseRange parses a single "bytes=start-end" Range header and clamps it to
+// [0, size). It reports false for anything else, including suffix and
+// open-ended ranges, which this test never sends.
+func parseRange(header string, size int64) (start, end int64, ok bool) {
+	spec, ok := strings.CutPrefix(header, "bytes=")
+	if !ok {
+		return 0, 0, false
+	}
+	lo, hi, ok := strings.Cut(spec, "-")
+	if !ok {
+		return 0, 0, false
+	}
+	start, err1 := strconv.ParseInt(lo, 10, 64)
+	end, err2 := strconv.ParseInt(hi, 10, 64)
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return max(start, 0), min(end, size-1), true
+}
+
+// mark records bytes start..end (inclusive) as served.
+func (s *rangeTrackingServer) mark(start, end int64) {
+	for i := start; i <= end; i++ {
+		if !s.served[i] {
+			s.served[i] = true
+			s.bytes++
 		}
 	}
-	http.ServeContent(w, r, "test.zip", time.Time{}, bytes.NewReader(s.content))
+}
+
+// servedIn counts the served bytes in [from, to) and returns the first served
+// offset, or -1 if none was served.
+func (s *rangeTrackingServer) servedIn(from, to int64) (count int, first int64) {
+	first = -1
+	for i := from; i < to; i++ {
+		if !s.served[i] {
+			continue
+		}
+		count++
+		if first < 0 {
+			first = i
+		}
+	}
+	return count, first
+}
+
+// patternedBlob returns n bytes with a non-repeating-looking pattern, so the
+// blob can be located verbatim inside an archive.
+func patternedBlob(n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(i * 31)
+	}
+	return b
 }
 
 // TestOnlyPartialDownload is a regression guard against accidentally fetching
@@ -176,36 +190,14 @@ func (s *rangeTrackingServer) handler(w http.ResponseWriter, r *http.Request) {
 func TestOnlyPartialDownload(t *testing.T) {
 	// A 1 MiB blob, stored (not deflated) so its bytes appear verbatim in the
 	// archive as a large, contiguous, identifiable region.
-	big := make([]byte, 1<<20)
-	for i := range big {
-		big[i] = byte(i * 31)
-	}
+	big := patternedBlob(1 << 20)
 	small := []byte("the one true pine cone")
 
-	var buf bytes.Buffer
-	zw := zip.NewWriter(&buf)
-
-	bw, err := zw.CreateHeader(&zip.FileHeader{Name: "big.bin", Method: zip.Store})
-	if err != nil {
-		t.Fatalf("CreateHeader big.bin: %v", err)
-	}
-	if _, err := bw.Write(big); err != nil {
-		t.Fatalf("write big.bin: %v", err)
-	}
-
-	sw, err := zw.Create("small.txt")
-	if err != nil {
-		t.Fatalf("Create small.txt: %v", err)
-	}
-	if _, err := sw.Write(small); err != nil {
-		t.Fatalf("write small.txt: %v", err)
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatalf("zip.Close: %v", err)
-	}
-
-	content := buf.Bytes()
-	bigOffset := bytes.Index(content, big) // start of the stored big.bin body
+	content := ziptest.Archive(t,
+		ziptest.File{Name: "big.bin", Data: big, Method: zip.Store},
+		ziptest.File{Name: "small.txt", Data: small, Method: zip.Deflate},
+	)
+	bigOffset := int64(bytes.Index(content, big)) // start of the stored big.bin body
 	if bigOffset < 0 {
 		t.Fatal("could not locate big.bin body in archive")
 	}
@@ -227,15 +219,7 @@ func TestOnlyPartialDownload(t *testing.T) {
 	const eocdScanWindow = 1024
 	scanFloor := int64(len(content)) - eocdScanWindow
 
-	bodyServed, firstServed := 0, int64(-1)
-	for i := int64(bigOffset); i < int64(bigOffset)+int64(len(big)); i++ {
-		if srv.served[i] {
-			bodyServed++
-			if firstServed < 0 {
-				firstServed = i
-			}
-		}
-	}
+	bodyServed, firstServed := srv.servedIn(bigOffset, bigOffset+int64(len(big)))
 	if firstServed >= 0 && firstServed < scanFloor {
 		t.Errorf("big.bin body fetched at offset %d, before the EOCD scan floor %d",
 			firstServed, scanFloor)
@@ -263,7 +247,7 @@ func TestList(t *testing.T) {
 
 	want := make([]string, len(zipFiles))
 	for i, f := range zipFiles {
-		want[i] = f.name
+		want[i] = f.Name
 	}
 	slices.Sort(got)
 	slices.Sort(want)
